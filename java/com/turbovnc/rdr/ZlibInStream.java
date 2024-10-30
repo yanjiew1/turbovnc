@@ -23,7 +23,8 @@
 //
 
 package com.turbovnc.rdr;
-import com.jcraft.jzlib.*;
+import java.util.zip.Inflater;
+import java.util.zip.DataFormatException;
 
 public class ZlibInStream extends InStream {
 
@@ -33,14 +34,8 @@ public class ZlibInStream extends InStream {
     bufSize = bufSize_;
     b = new byte[bufSize];
     bytesIn = offset = 0;
-    zs = new ZStream();
-    zs.next_in = null;
-    zs.next_in_index = 0;
-    zs.avail_in = 0;
-    if (zs.inflateInit() != JZlib.Z_OK) {
-      zs = null;
-      throw new ErrorException("ZlibInStream: inflateInit failed");
-    }
+    inflater = new Inflater();
+    needsInput = true;
     ptr = end = start = 0;
   }
 
@@ -48,7 +43,7 @@ public class ZlibInStream extends InStream {
 
   public void close() {
     b = null;
-    zs.inflateEnd();
+    inflater.end();
   }
 
   public void setUnderlying(InStream is, int bytesIn_) {
@@ -63,20 +58,26 @@ public class ZlibInStream extends InStream {
 
   public void reset() {
     ptr = end = start;
-    if (underlying == null) return;
 
     while (bytesIn > 0) {
       decompress(true);
-      end = start;  // throw away any data
+      ptr = end = start;
     }
-    underlying = null;
+
+    try {
+      int buflen = bufSize - start;
+      while (inflater.inflate(b, start, buflen) == buflen);
+    } catch (DataFormatException e) {
+      throw new ErrorException("ZlibInStream: inflate failed");
+    }
+
+    needsInput = true;
+    setUnderlying(null, 0);
   }
 
   protected int overrun(int itemSize, int nItems, boolean wait) {
     if (itemSize > bufSize)
       throw new ErrorException("ZlibInStream overrun: max itemSize exceeded");
-    if (underlying == null)
-      throw new ErrorException("ZlibInStream overrun: no underlying stream");
 
     if (end - ptr != 0)
       System.arraycopy(b, ptr, b, start, end - ptr);
@@ -96,42 +97,59 @@ public class ZlibInStream extends InStream {
     return nItems;
   }
 
-  // decompress() calls the decompressor once.  Note that this won't
-  // necessarily generate any output data - it may just consume some input
-  // data.  Returns false if wait is false and we would block on the underlying
+  // decompress() calls the decompressor once. 
+  //
+  // It is possible that the decompressor generate some output data without
+  // consuming any input data, or generate no output data while consuming input
+  // data. Returns false if wait is false and we would block on the underlying
   // stream.
-
   private boolean decompress(boolean wait) {
-    if (zs.inflateFinished())
-      throw new ErrorException("ZlibInStream: unexpected end of zlib stream");
+    if (underlying == null)
+      throw new ErrorException("ZlibInStream overrun: no underlying stream");
+    if (inflater.finished())
+      throw new ErrorException("ZlibInStream decompress: end of zlib stream");
 
-    zs.next_out = b;
-    zs.next_out_index = end;
-    zs.avail_out = start + bufSize - end;
+    if (needsInput) {
+      int n = underlying.check(1, 1, wait);
+      if (n == 0) return false;
+      needsInput = false;
+    }
 
-    int n = underlying.check(1, 1, wait);
-    if (n == 0) return false;
-    zs.next_in = underlying.getbuf();
-    zs.next_in_index = underlying.getptr();
-    zs.avail_in = underlying.getend() - underlying.getptr();
-    if (zs.avail_in > bytesIn)
-      zs.avail_in = bytesIn;
+    try {
+      int underlyingPtr = underlying.getptr();
+      int inputLen = underlying.getend() - underlyingPtr;
+      int outputLen = bufSize - end;
+      if (inputLen > bytesIn)
+        inputLen = bytesIn;
 
-    int rc = zs.inflate(JZlib.Z_SYNC_FLUSH);
-    if (rc != JZlib.Z_OK && rc != JZlib.Z_STREAM_END) {
+      inflater.setInput(underlying.getbuf(), underlyingPtr, inputLen);
+      int bytesOut = inflater.inflate(b, end, outputLen);
+      int bytesConsumed = inputLen - inflater.getRemaining();
+
+      // If output buffer is not full, it is garanteed that there is no
+      // pending output data in the inflater itself.
+      //
+      // The Inflater.needsInput() only checks if the input buffer is empty,
+      // which is not sufficient because the inflater itself may have some
+      // pending output data.
+      if (bytesOut < outputLen)
+        needsInput = true;
+
+      end += bytesOut;
+      bytesIn -= bytesConsumed;
+      underlying.setptr(underlyingPtr + bytesConsumed);
+    } catch (DataFormatException e) {
       throw new ErrorException("ZlibInStream: inflate failed");
     }
 
-    bytesIn -= zs.next_in_index - underlying.getptr();
-    end = zs.next_out_index;
-    underlying.setptr(zs.next_in_index);
     return true;
   }
 
   private InStream underlying;
   private int bufSize;
   private int offset;
-  private com.jcraft.jzlib.ZStream zs;
+  private Inflater inflater;
+  private boolean needsInput;
   private int bytesIn;
   private int start;
 }
